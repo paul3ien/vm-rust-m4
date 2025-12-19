@@ -1,0 +1,9 @@
+{
+  "name": "MinimalLinuxVM",
+  "cpu_count": 2,
+  "memory_size_gb": 2,
+  "kernel_path": "data/vmlinuz",
+  "initrd_path": "data/initrd.img",
+  "disk_path": "data/disk.img",
+  "disk_size_gb": 10
+}
