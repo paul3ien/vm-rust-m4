@@ -288,6 +288,7 @@ dependencies = [
  "cc",
  "cocoa",
  "core-graphics",
+ "libc",
  "objc",
  "objc-foundation",
  "objc_id",

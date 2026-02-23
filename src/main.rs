@@ -1,41 +1,98 @@
 use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
 use objc_foundation::{INSString, NSString};
-use objc_id::{Id, Owned};
 use std::path::PathBuf;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use block::ConcreteBlock;
 
-// --- CONFIGURATION ---
+/// Paramètres terminaux originaux, sauvegardés pour restauration à la sortie.
+static mut ORIG_TERMIOS: Option<libc::termios> = None;
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 struct VMConfig {
     name: String,
     cpu_count: u32,
     memory_size_gb: u32,
-    kernel_path: String,
-    initrd_path: String,
     disk_path: Option<String>,
+    disk_size_gb: u32,
     iso_path: Option<String>,
 }
 
 impl Default for VMConfig {
     fn default() -> Self {
         Self {
-            name: "UbuntuVM".to_string(),
+            name: "UbuntuEFI".to_string(),
             cpu_count: 2,
-            memory_size_gb: 4, // 4GB RAM pour être à l'aise avec l'installateur
-            kernel_path: "data/vmlinuz".to_string(),
-            initrd_path: "data/initrd.img".to_string(),
+            memory_size_gb: 4,
             disk_path: Some("data/disk.img".to_string()),
+            disk_size_gb: 10,
             iso_path: Some("data/ubuntu.iso".to_string()),
         }
     }
 }
 
+impl VMConfig {
+    fn load_or_default() -> Self {
+        let path = "vm_config.json";
+        if std::path::Path::new(path).exists() {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(config) = serde_json::from_str::<VMConfig>(&content) {
+                    println!("Configuration chargée depuis {}", path);
+                    return config;
+                } else {
+                    eprintln!("Erreur de parsing dans {}, utilisation des défauts.", path);
+                }
+            }
+        }
+        Self::default()
+    }
+}
+
 #[link(name = "Virtualization", kind = "framework")]
 extern "C" {}
+
+// ─── Mode raw du terminal ────────────────────────────────────────
+
+/// Active le mode raw : les touches fléchées, Échap, etc. sont
+/// envoyées directement à la VM au lieu d'être interprétées.
+fn enable_raw_mode() {
+    unsafe {
+        let mut termios: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut termios) == 0 {
+            ORIG_TERMIOS = Some(termios);
+            let mut raw = termios;
+            libc::cfmakeraw(&mut raw);
+            // Garder ISIG pour que Ctrl+C permette de quitter proprement
+            raw.c_lflag |= libc::ISIG;
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw);
+        }
+    }
+}
+
+/// Restaure les paramètres du terminal.
+fn disable_raw_mode() {
+    unsafe {
+        if let Some(ref termios) = ORIG_TERMIOS {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, termios);
+        }
+    }
+}
+
+extern "C" fn on_exit_cleanup() {
+    disable_raw_mode();
+}
+
+extern "C" fn signal_handler(sig: libc::c_int) {
+    disable_raw_mode();
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+// ─── VirtualMachine ──────────────────────────────────────────────
 
 struct VirtualMachine {
     config: VMConfig,
@@ -48,132 +105,139 @@ impl VirtualMachine {
 
     fn create_vm(&self) -> Result<()> {
         unsafe {
-            // 1. Vérification du support
             let supported: bool = msg_send![class!(VZVirtualMachine), isSupported];
             if !supported {
-                anyhow::bail!("Virtualisation non supportée sur ce Mac.");
+                anyhow::bail!("Virtualisation non supportée.");
             }
 
             let vm_config: *mut Object = msg_send![class!(VZVirtualMachineConfiguration), new];
             
-            // 2. CPU & RAM
+            // CPU & RAM
             let _: () = msg_send![vm_config, setCPUCount: self.config.cpu_count as u64];
             let memory_bytes = (self.config.memory_size_gb as u64) * 1024 * 1024 * 1024;
             let _: () = msg_send![vm_config, setMemorySize: memory_bytes];
 
-            // 3. Bootloader (Kernel + Initrd)
-            let bootloader = self.create_linux_bootloader()?;
-            let _: () = msg_send![vm_config, setBootLoader: bootloader];
+            // EFI (BIOS)
+            self.configure_efi(vm_config)?;
 
-            // 4. Périphériques (Disques, ISO, Console, Réseau)
+            // Périphériques
             self.configure_devices(vm_config)?;
 
-            // 5. Validation
+            // Validation
             let mut error: *mut Object = std::ptr::null_mut();
             let is_valid: bool = msg_send![vm_config, validateWithError: &mut error];
-            
             if !is_valid {
                 let error_msg = if !error.is_null() {
                     let desc: *mut Object = msg_send![error, localizedDescription];
                     let desc_str: *const i8 = msg_send![desc, UTF8String];
                     std::ffi::CStr::from_ptr(desc_str).to_string_lossy().to_string()
-                } else {
-                    "Erreur inconnue".to_string()
-                };
-                anyhow::bail!("Configuration invalide : {}", error_msg);
+                } else { "Erreur inconnue".to_string() };
+                anyhow::bail!("Config invalide : {}", error_msg);
             }
 
-            // 6. Instanciation
+            // Instanciation
             let vm: *mut Object = msg_send![class!(VZVirtualMachine), alloc];
             let vm: *mut Object = msg_send![vm, initWithConfiguration: vm_config];
 
-            println!("✓ VM Prête : {}", self.config.name);
-            println!("  ISO : {:?}", self.config.iso_path);
-            
+            println!("✓ Mode EFI activé pour : {}", self.config.name);
             self.start_vm(vm)?;
 
             Ok(())
         }
     }
 
-    unsafe fn create_linux_bootloader(&self) -> Result<*mut Object> {
-        let bootloader: *mut Object = msg_send![class!(VZLinuxBootLoader), new];
+    unsafe fn configure_efi(&self, vm_config: *mut Object) -> Result<()> {
+        println!("Configuration de l'EFI (Mode Headless)...");
 
-        // Kernel
-        let kernel_path = PathBuf::from(&self.config.kernel_path);
-        let kernel_url = self.path_to_nsurl(&kernel_path)?;
-        let _: () = msg_send![bootloader, setKernelURL: kernel_url];
+        // 1. Bootloader
+        let bootloader: *mut Object = msg_send![class!(VZEFIBootLoader), new];
+        
+        let nvram_path = PathBuf::from("nvram.dat");
+        let nvram_url = self.path_to_nsurl(&nvram_path)?;
+        
+        let variable_store: *mut Object = msg_send![class!(VZEFIVariableStore), alloc];
+        let variable_store: *mut Object = if nvram_path.exists() {
+            msg_send![variable_store, initWithURL: nvram_url]
+        } else {
+            let mut error: *mut Object = std::ptr::null_mut();
+            let res: *mut Object = msg_send![
+                variable_store, 
+                initCreatingVariableStoreAtURL: nvram_url 
+                options: 0u64 
+                error: &mut error
+            ];
+            if res.is_null() { anyhow::bail!("Erreur NVRAM"); }
+            res
+        };
+        
+        let _: () = msg_send![bootloader, setVariableStore: variable_store];
+        let _: () = msg_send![vm_config, setBootLoader: bootloader];
 
-        // Initrd
-        let initrd_path = PathBuf::from(&self.config.initrd_path);
-        let initrd_url = self.path_to_nsurl(&initrd_path)?;
-        let _: () = msg_send![bootloader, setInitialRamdiskURL: initrd_url];
+        // 2. Platform
+        let platform: *mut Object = msg_send![class!(VZGenericPlatformConfiguration), new];
+        let machine_id: *mut Object = msg_send![class!(VZGenericMachineIdentifier), new];
+        let _: () = msg_send![platform, setMachineIdentifier: machine_id];
+        let _: () = msg_send![vm_config, setPlatform: platform];
 
-        // Ligne de commande Ubuntu
-        // console=hvc0 : Affiche le texte sur le terminal
-        // boot=casper  : Indique le mode Live CD
-        let cmd_line = NSString::from_str("console=hvc0 boot=casper ---");
-        let _: () = msg_send![bootloader, setCommandLine: &*cmd_line];
+        // 3. IMPORTANT : PAS DE CARTE GRAPHIQUE !
+        // On ne met rien dans setGraphicsDevices.
+        // Cela force l'EFI à utiliser la console série.
 
-        Ok(bootloader)
+        Ok(())
     }
 
     unsafe fn configure_devices(&self, vm_config: *mut Object) -> Result<()> {
-        // --- A. Console Interactive (Clavier + Écran) ---
+        // 1. Console Série (seul moyen de communication en headless)
         let serial_config = self.create_interactive_console()?;
         let serial_array: *mut Object = msg_send![class!(NSMutableArray), new];
         let _: () = msg_send![serial_array, addObject: serial_config];
         let _: () = msg_send![vm_config, setSerialPorts: serial_array];
 
-        // --- B. Stockage (Disque + ISO) ---
+        // 2. Stockage
         let storage_array: *mut Object = msg_send![class!(NSMutableArray), new];
 
-        // 1. Disque Dur (Installation)
+        // 2a. Disque principal (VirtIO block — rapide)
         if let Some(disk_path) = &self.config.disk_path {
-            let disk = self.create_block_device(disk_path, false)?;
+            let disk = self.create_disk_device(disk_path)?;
             let _: () = msg_send![storage_array, addObject: disk];
         }
 
-        // 2. ISO Ubuntu (Source)
+        // 2b. ISO d'installation (USB Mass Storage — compatible installeur)
         if let Some(iso_path) = &self.config.iso_path {
             if std::path::Path::new(iso_path).exists() {
-                println!("Attachement de l'ISO : {}", iso_path);
-                let iso = self.create_block_device(iso_path, true)?;
+                let iso = self.create_usb_storage_device(iso_path)?;
                 let _: () = msg_send![storage_array, addObject: iso];
+                println!("  ISO montée en USB Mass Storage : {}", iso_path);
             } else {
-                println!("⚠️ ISO non trouvé : {}", iso_path);
+                println!("  Pas d'ISO trouvée à : {} (boot disque)", iso_path);
             }
         }
+
         let _: () = msg_send![vm_config, setStorageDevices: storage_array];
 
-        // --- C. Réseau (NAT) ---
+        // 3. Réseau (NAT)
         let nat: *mut Object = msg_send![class!(VZNATNetworkDeviceAttachment), new];
         let net: *mut Object = msg_send![class!(VZVirtioNetworkDeviceConfiguration), new];
         let _: () = msg_send![net, setAttachment: nat];
-        let net_array: *mut Object = msg_send![class!(NSMutableArray), new];
-        let _: () = msg_send![net_array, addObject: net];
-        let _: () = msg_send![vm_config, setNetworkDevices: net_array];
+        let net_arr: *mut Object = msg_send![class!(NSMutableArray), new];
+        let _: () = msg_send![net_arr, addObject: net];
+        let _: () = msg_send![vm_config, setNetworkDevices: net_arr];
 
-        // --- D. Entropie ---
+        // 4. Entropie (accélère la génération de clés SSH, etc.)
         let entropy: *mut Object = msg_send![class!(VZVirtioEntropyDeviceConfiguration), new];
-        let entropy_array: *mut Object = msg_send![class!(NSMutableArray), new];
-        let _: () = msg_send![entropy_array, addObject: entropy];
-        let _: () = msg_send![vm_config, setEntropyDevices: entropy_array];
+        let entropy_arr: *mut Object = msg_send![class!(NSMutableArray), new];
+        let _: () = msg_send![entropy_arr, addObject: entropy];
+        let _: () = msg_send![vm_config, setEntropyDevices: entropy_arr];
 
         Ok(())
     }
 
     unsafe fn create_interactive_console(&self) -> Result<*mut Object> {
-        println!("Configuration de la console interactive (Stdin/Stdout)...");
-
-        // Sortie (Écran)
         let write_handle: *mut Object = msg_send![class!(NSFileHandle), fileHandleWithStandardOutput];
-        
-        // Entrée (Clavier)
         let read_handle: *mut Object = msg_send![class!(NSFileHandle), fileHandleWithStandardInput];
 
         if write_handle.is_null() || read_handle.is_null() {
-            anyhow::bail!("Impossible d'accéder au terminal.");
+            anyhow::bail!("Terminal inaccessible.");
         }
 
         let attachment: *mut Object = msg_send![class!(VZFileHandleSerialPortAttachment), alloc];
@@ -189,88 +253,152 @@ impl VirtualMachine {
         Ok(serial_config)
     }
 
-    unsafe fn create_block_device(&self, path_str: &str, read_only: bool) -> Result<*mut Object> {
+    /// Crée un disque VirtIO block (pour le disque principal).
+    unsafe fn create_disk_device(&self, path_str: &str) -> Result<*mut Object> {
         let path = PathBuf::from(path_str);
-        
-        if !read_only && !path.exists() {
-            println!("Création du disque : {}", path_str);
+
+        if !path.exists() {
+            println!("  Création disque : {} ({} Go)", path_str, self.config.disk_size_gb);
             if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-            let size = 10u64 * 1024 * 1024 * 1024; // 10 GB
+            let size = (self.config.disk_size_gb as u64) * 1024 * 1024 * 1024;
             std::fs::File::create(&path)?.set_len(size)?;
         }
 
         let url = self.path_to_nsurl(&path)?;
         let mut error: *mut Object = std::ptr::null_mut();
-        
+
         let attachment: *mut Object = msg_send![class!(VZDiskImageStorageDeviceAttachment), alloc];
         let attachment: *mut Object = msg_send![
             attachment,
             initWithURL: url
-            readOnly: read_only
+            readOnly: false
             error: &mut error
         ];
 
         if attachment.is_null() {
-            anyhow::bail!("Impossible d'attacher : {}", path_str);
+            let err_msg = Self::nsobj_error_string(error);
+            anyhow::bail!("Impossible d'attacher le disque {} : {}", path_str, err_msg);
         }
 
         let config: *mut Object = msg_send![class!(VZVirtioBlockDeviceConfiguration), alloc];
         let config: *mut Object = msg_send![config, initWithAttachment: attachment];
-
         Ok(config)
     }
 
+    /// Crée un périphérique USB Mass Storage (pour l'ISO — compatible installeur Linux).
+    unsafe fn create_usb_storage_device(&self, path_str: &str) -> Result<*mut Object> {
+        let path = PathBuf::from(path_str);
+        let url = self.path_to_nsurl(&path)?;
+        let mut error: *mut Object = std::ptr::null_mut();
+
+        let attachment: *mut Object = msg_send![class!(VZDiskImageStorageDeviceAttachment), alloc];
+        let attachment: *mut Object = msg_send![
+            attachment,
+            initWithURL: url
+            readOnly: true
+            error: &mut error
+        ];
+
+        if attachment.is_null() {
+            let err_msg = Self::nsobj_error_string(error);
+            anyhow::bail!("Impossible d'attacher l'ISO {} : {}", path_str, err_msg);
+        }
+
+        // USB Mass Storage — l'installeur Ubuntu le détecte comme un CDROM/USB
+        let config: *mut Object = msg_send![class!(VZUSBMassStorageDeviceConfiguration), alloc];
+        let config: *mut Object = msg_send![config, initWithAttachment: attachment];
+        Ok(config)
+    }
+
+    /// Extrait le message d'erreur d'un NSError.
+    unsafe fn nsobj_error_string(error: *mut Object) -> String {
+        if !error.is_null() {
+            let desc: *mut Object = msg_send![error, localizedDescription];
+            let desc_str: *const i8 = msg_send![desc, UTF8String];
+            std::ffi::CStr::from_ptr(desc_str).to_string_lossy().to_string()
+        } else {
+            "erreur inconnue".to_string()
+        }
+    }
+
     unsafe fn start_vm(&self, vm: *mut Object) -> Result<()> {
-        println!("\n🚀 Démarrage...");
-        
+        println!("\n🚀 Démarrage de la VM...");
         let block = ConcreteBlock::new(|error: *mut Object| {
             if !error.is_null() {
-                let desc: *mut Object = msg_send![error, localizedDescription];
-                let desc_str: *const i8 = msg_send![desc, UTF8String];
-                let error_msg = std::ffi::CStr::from_ptr(desc_str).to_string_lossy();
-                eprintln!("\n❌ ERREUR VM : {}\n", error_msg);
+                disable_raw_mode();
+                let msg = VirtualMachine::nsobj_error_string(error);
+                eprintln!("\nErreur au démarrage de la VM : {}", msg);
                 std::process::exit(1);
             }
         });
-        
         let block = block.copy();
         let _: () = msg_send![vm, startWithCompletionHandler: &*block];
-
         Ok(())
     }
 
     unsafe fn path_to_nsurl(&self, path: &PathBuf) -> Result<*mut Object> {
-        let abs = std::fs::canonicalize(path).context(format!("Chemin introuvable: {:?}", path))?;
-        let s = NSString::from_str(abs.to_str().unwrap());
+        let abs_path = if path.exists() {
+            std::fs::canonicalize(path)?
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        
+        let s = NSString::from_str(abs_path.to_str().unwrap());
         Ok(msg_send![class!(NSURL), fileURLWithPath: &*s])
     }
 }
 
 fn main() -> Result<()> {
-    println!("=== VM Manager (Mac Silicon) ===");
-    
-    // Nettoyage de l'ancien log
-    if std::path::Path::new("linux.log").exists() {
-        let _ = std::fs::remove_file("linux.log");
+    println!("=== VM Manager (EFI Headless) ===");
+
+    // Nettoyage nvram corrompue
+    if std::path::Path::new("nvram.dat").exists() {
+        let metadata = std::fs::metadata("nvram.dat")?;
+        if metadata.len() == 0 {
+            println!("Suppression nvram.dat vide...");
+            std::fs::remove_file("nvram.dat")?;
+        }
     }
 
-    // Flush important
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let config = VMConfig::load_or_default();
+    println!(
+        "VM: {} | CPU: {} | RAM: {} Go | Disque: {} Go",
+        config.name, config.cpu_count, config.memory_size_gb, config.disk_size_gb
+    );
 
-    let config = VMConfig::default();
     let vm = VirtualMachine::new(config);
-    
     vm.create_vm()?;
 
-    println!("\n⌨️  Console interactive active.");
-    println!("(Appuyez sur Entrée si l'affichage semble bloqué)");
-    println!("(Ctrl+C pour quitter)\n");
+    // Tous les messages AVANT le mode raw (sinon \n ne fait plus \r\n)
+    println!("\n╔══════════════════════════════════════════════════╗");
+    println!("║  Console série active — mode raw                  ║");
+    println!("║  Flèches / Tab / touches spéciales : OK           ║");
+    println!("║  Ctrl+C pour arrêter la VM.                       ║");
+    println!("║                                                    ║");
+    println!("║  Astuce GRUB : touche 'e' pour éditer, puis       ║");
+    println!("║  ajouter console=hvc0 à la ligne 'linux' si       ║");
+    println!("║  l'installeur ne s'affiche pas correctement.      ║");
+    println!("╚══════════════════════════════════════════════════╝");
 
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    // Activer le mode raw APRÈS tous les println!
+    enable_raw_mode();
+
+    // Enregistrer les handlers de nettoyage du terminal
+    unsafe {
+        libc::atexit(on_exit_cleanup);
+        libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
+    }
+
+    // Boucle principale (bloque ici indéfiniment)
     unsafe {
         let run_loop: *mut Object = msg_send![class!(NSRunLoop), mainRunLoop];
         let _: () = msg_send![run_loop, run];
     }
-    
+
+    disable_raw_mode();
     Ok(())
 }
