@@ -1,8 +1,17 @@
-# Preparation (une seule fois)
-bash prepare_cloud_image.sh
-
-# Lancement
-rm -f nvram.dat
+# Initialisation (telecharge et prepare tout)
 cargo build
 codesign --entitlements entitlements.plist --force -s - target/debug/vm-rust-m4
+./target/debug/vm-rust-m4 --init
+
+# Lancement normal
+rm -f nvram.dat
 ./target/debug/vm-rust-m4
+
+# Avec logs de debug
+./target/debug/vm-rust-m4 --debug
+
+# Mode daemon
+./target/debug/vm-rust-m4 --daemon
+
+# Tout personnaliser
+./target/debug/vm-rust-m4 --init --disk-size 20
