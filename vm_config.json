@@ -2,7 +2,8 @@
   "name": "UbuntuEFI",
   "cpu_count": 4,
   "memory_size_gb": 4,
-  "disk_path": "data/disk.img",
+  "disk_path": "data/ubuntu-cloud-raw.img",
   "disk_size_gb": 10,
-  "iso_path": "data/ubuntu.iso"
+  "iso_path": null,
+  "seed_path": "data/cidata.iso"
 }

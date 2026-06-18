@@ -1,12 +1,12 @@
-use objc::runtime::{Class, Object};
+use anyhow::Result;
+use block::ConcreteBlock;
+use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use objc_foundation::{INSString, NSString};
-use std::path::PathBuf;
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use block::ConcreteBlock;
+use std::path::PathBuf;
 
-/// Paramètres terminaux originaux, sauvegardés pour restauration à la sortie.
+/// Parametres terminaux originaux, sauvegardes pour restauration a la sortie.
 static mut ORIG_TERMIOS: Option<libc::termios> = None;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -17,18 +17,24 @@ struct VMConfig {
     memory_size_gb: u32,
     disk_path: Option<String>,
     disk_size_gb: u32,
+    /// ISO d'installation (pour le mode installation).
+    /// Si absent et seed_path present -> mode cloud-image pre-installee.
     iso_path: Option<String>,
+    /// ISO cloud-init seed (cidata.iso) pour configurer l'image cloud au 1er boot.
+    /// Contient user-data et meta-data.
+    seed_path: Option<String>,
 }
 
 impl Default for VMConfig {
     fn default() -> Self {
         Self {
             name: "UbuntuEFI".to_string(),
-            cpu_count: 2,
+            cpu_count: 4,
             memory_size_gb: 4,
-            disk_path: Some("data/disk.img".to_string()),
+            disk_path: Some("data/ubuntu-cloud-raw.img".to_string()),
             disk_size_gb: 10,
-            iso_path: Some("data/ubuntu.iso".to_string()),
+            iso_path: None,
+            seed_path: Some("data/cidata.iso".to_string()),
         }
     }
 }
@@ -39,10 +45,10 @@ impl VMConfig {
         if std::path::Path::new(path).exists() {
             if let Ok(content) = std::fs::read_to_string(path) {
                 if let Ok(config) = serde_json::from_str::<VMConfig>(&content) {
-                    println!("Configuration chargée depuis {}", path);
+                    println!("Configuration chargee depuis {}", path);
                     return config;
                 } else {
-                    eprintln!("Erreur de parsing dans {}, utilisation des défauts.", path);
+                    eprintln!("Erreur de parsing dans {}, utilisation des defauts.", path);
                 }
             }
         }
@@ -53,10 +59,8 @@ impl VMConfig {
 #[link(name = "Virtualization", kind = "framework")]
 extern "C" {}
 
-// ─── Mode raw du terminal ────────────────────────────────────────
+// --- Mode raw du terminal ----------------------------------------
 
-/// Active le mode raw : les touches fléchées, Échap, etc. sont
-/// envoyées directement à la VM au lieu d'être interprétées.
 fn enable_raw_mode() {
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
@@ -71,7 +75,6 @@ fn enable_raw_mode() {
     }
 }
 
-/// Restaure les paramètres du terminal.
 fn disable_raw_mode() {
     unsafe {
         if let Some(ref termios) = ORIG_TERMIOS {
@@ -92,7 +95,7 @@ extern "C" fn signal_handler(sig: libc::c_int) {
     }
 }
 
-// ─── VirtualMachine ──────────────────────────────────────────────
+// --- VirtualMachine ----------------------------------------------
 
 struct VirtualMachine {
     config: VMConfig,
@@ -107,11 +110,11 @@ impl VirtualMachine {
         unsafe {
             let supported: bool = msg_send![class!(VZVirtualMachine), isSupported];
             if !supported {
-                anyhow::bail!("Virtualisation non supportée.");
+                anyhow::bail!("Virtualisation non supportee.");
             }
 
             let vm_config: *mut Object = msg_send![class!(VZVirtualMachineConfiguration), new];
-            
+
             // CPU & RAM
             let _: () = msg_send![vm_config, setCPUCount: self.config.cpu_count as u64];
             let memory_bytes = (self.config.memory_size_gb as u64) * 1024 * 1024 * 1024;
@@ -120,7 +123,7 @@ impl VirtualMachine {
             // EFI (BIOS)
             self.configure_efi(vm_config)?;
 
-            // Périphériques
+            // Peripheriques
             self.configure_devices(vm_config)?;
 
             // Validation
@@ -130,8 +133,12 @@ impl VirtualMachine {
                 let error_msg = if !error.is_null() {
                     let desc: *mut Object = msg_send![error, localizedDescription];
                     let desc_str: *const i8 = msg_send![desc, UTF8String];
-                    std::ffi::CStr::from_ptr(desc_str).to_string_lossy().to_string()
-                } else { "Erreur inconnue".to_string() };
+                    std::ffi::CStr::from_ptr(desc_str)
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    "Erreur inconnue".to_string()
+                };
                 anyhow::bail!("Config invalide : {}", error_msg);
             }
 
@@ -139,7 +146,7 @@ impl VirtualMachine {
             let vm: *mut Object = msg_send![class!(VZVirtualMachine), alloc];
             let vm: *mut Object = msg_send![vm, initWithConfiguration: vm_config];
 
-            println!("✓ Mode EFI activé pour : {}", self.config.name);
+            println!("Mode EFI active pour : {}", self.config.name);
             self.start_vm(vm)?;
 
             Ok(())
@@ -151,25 +158,27 @@ impl VirtualMachine {
 
         // 1. Bootloader
         let bootloader: *mut Object = msg_send![class!(VZEFIBootLoader), new];
-        
+
         let nvram_path = PathBuf::from("nvram.dat");
         let nvram_url = self.path_to_nsurl(&nvram_path)?;
-        
+
         let variable_store: *mut Object = msg_send![class!(VZEFIVariableStore), alloc];
         let variable_store: *mut Object = if nvram_path.exists() {
             msg_send![variable_store, initWithURL: nvram_url]
         } else {
             let mut error: *mut Object = std::ptr::null_mut();
             let res: *mut Object = msg_send![
-                variable_store, 
-                initCreatingVariableStoreAtURL: nvram_url 
-                options: 0u64 
+                variable_store,
+                initCreatingVariableStoreAtURL: nvram_url
+                options: 0u64
                 error: &mut error
             ];
-            if res.is_null() { anyhow::bail!("Erreur NVRAM"); }
+            if res.is_null() {
+                anyhow::bail!("Erreur NVRAM");
+            }
             res
         };
-        
+
         let _: () = msg_send![bootloader, setVariableStore: variable_store];
         let _: () = msg_send![vm_config, setBootLoader: bootloader];
 
@@ -180,14 +189,13 @@ impl VirtualMachine {
         let _: () = msg_send![vm_config, setPlatform: platform];
 
         // 3. IMPORTANT : PAS DE CARTE GRAPHIQUE !
-        // On ne met rien dans setGraphicsDevices.
-        // Cela force l'EFI à utiliser la console série.
+        // Cela force l'EFI a utiliser la console serie.
 
         Ok(())
     }
 
     unsafe fn configure_devices(&self, vm_config: *mut Object) -> Result<()> {
-        // 1. Console Série (seul moyen de communication en headless)
+        // 1. Console Serie (seul moyen de communication en headless)
         let serial_config = self.create_interactive_console()?;
         let serial_array: *mut Object = msg_send![class!(NSMutableArray), new];
         let _: () = msg_send![serial_array, addObject: serial_config];
@@ -196,26 +204,37 @@ impl VirtualMachine {
         // 2. Stockage
         let storage_array: *mut Object = msg_send![class!(NSMutableArray), new];
 
-        // 2a. Disque principal (VirtIO block — rapide)
+        // 2a. Disque principal (VirtIO block - rapide)
         if let Some(disk_path) = &self.config.disk_path {
             let disk = self.create_disk_device(disk_path)?;
             let _: () = msg_send![storage_array, addObject: disk];
         }
 
-        // 2b. ISO d'installation (USB Mass Storage — compatible installeur)
+        // 2b. ISO d'installation - VirtIO block read-only (mode installation)
         if let Some(iso_path) = &self.config.iso_path {
             if std::path::Path::new(iso_path).exists() {
-                let iso = self.create_usb_storage_device(iso_path)?;
-                let _: () = msg_send![storage_array, addObject: iso];
-                println!("  ISO montée en USB Mass Storage : {}", iso_path);
+                let iso_dev = self.create_virtio_readonly_device(iso_path)?;
+                let _: () = msg_send![storage_array, addObject: iso_dev];
+                println!("  ISO d'installation montee en VirtIO : {}", iso_path);
             } else {
-                println!("  Pas d'ISO trouvée à : {} (boot disque)", iso_path);
+                println!("  Pas d'ISO trouvee a : {} (boot disque)", iso_path);
+            }
+        }
+
+        // 2c. Cloud-init seed (cidata.iso) - pour image cloud pre-installee
+        if let Some(seed_path) = &self.config.seed_path {
+            if std::path::Path::new(seed_path).exists() {
+                let seed_dev = self.create_virtio_readonly_device(seed_path)?;
+                let _: () = msg_send![storage_array, addObject: seed_dev];
+                println!("  Seed cloud-init montee en VirtIO : {}", seed_path);
+            } else {
+                eprintln!("  Seed cloud-init introuvable : {}", seed_path);
             }
         }
 
         let _: () = msg_send![vm_config, setStorageDevices: storage_array];
 
-        // 3. Réseau (NAT)
+        // 3. Reseau (NAT)
         let nat: *mut Object = msg_send![class!(VZNATNetworkDeviceAttachment), new];
         let net: *mut Object = msg_send![class!(VZVirtioNetworkDeviceConfiguration), new];
         let _: () = msg_send![net, setAttachment: nat];
@@ -223,7 +242,7 @@ impl VirtualMachine {
         let _: () = msg_send![net_arr, addObject: net];
         let _: () = msg_send![vm_config, setNetworkDevices: net_arr];
 
-        // 4. Entropie (accélère la génération de clés SSH, etc.)
+        // 4. Entropie (accelere la generation de cles SSH, etc.)
         let entropy: *mut Object = msg_send![class!(VZVirtioEntropyDeviceConfiguration), new];
         let entropy_arr: *mut Object = msg_send![class!(NSMutableArray), new];
         let _: () = msg_send![entropy_arr, addObject: entropy];
@@ -233,7 +252,8 @@ impl VirtualMachine {
     }
 
     unsafe fn create_interactive_console(&self) -> Result<*mut Object> {
-        let write_handle: *mut Object = msg_send![class!(NSFileHandle), fileHandleWithStandardOutput];
+        let write_handle: *mut Object =
+            msg_send![class!(NSFileHandle), fileHandleWithStandardOutput];
         let read_handle: *mut Object = msg_send![class!(NSFileHandle), fileHandleWithStandardInput];
 
         if write_handle.is_null() || read_handle.is_null() {
@@ -247,21 +267,22 @@ impl VirtualMachine {
             fileHandleForWriting: write_handle
         ];
 
-        let serial_config: *mut Object = msg_send![class!(VZVirtioConsoleDeviceSerialPortConfiguration), new];
+        let serial_config: *mut Object =
+            msg_send![class!(VZVirtioConsoleDeviceSerialPortConfiguration), new];
         let _: () = msg_send![serial_config, setAttachment: attachment];
 
         Ok(serial_config)
     }
 
-    /// Crée un disque VirtIO block (pour le disque principal).
+    /// Cree un disque VirtIO block (pour le disque principal).
     unsafe fn create_disk_device(&self, path_str: &str) -> Result<*mut Object> {
         let path = PathBuf::from(path_str);
 
         if !path.exists() {
-            println!("  Création disque : {} ({} Go)", path_str, self.config.disk_size_gb);
-            if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
-            let size = (self.config.disk_size_gb as u64) * 1024 * 1024 * 1024;
-            std::fs::File::create(&path)?.set_len(size)?;
+            anyhow::bail!(
+                "Disque introuvable : {}. Lance ./prepare_cloud_image.sh d'abord.",
+                path_str
+            );
         }
 
         let url = self.path_to_nsurl(&path)?;
@@ -285,8 +306,8 @@ impl VirtualMachine {
         Ok(config)
     }
 
-    /// Crée un périphérique USB Mass Storage (pour l'ISO — compatible installeur Linux).
-    unsafe fn create_usb_storage_device(&self, path_str: &str) -> Result<*mut Object> {
+    /// Cree un peripherique VirtIO block read-only (pour l'ISO).
+    unsafe fn create_virtio_readonly_device(&self, path_str: &str) -> Result<*mut Object> {
         let path = PathBuf::from(path_str);
         let url = self.path_to_nsurl(&path)?;
         let mut error: *mut Object = std::ptr::null_mut();
@@ -304,8 +325,7 @@ impl VirtualMachine {
             anyhow::bail!("Impossible d'attacher l'ISO {} : {}", path_str, err_msg);
         }
 
-        // USB Mass Storage — l'installeur Ubuntu le détecte comme un CDROM/USB
-        let config: *mut Object = msg_send![class!(VZUSBMassStorageDeviceConfiguration), alloc];
+        let config: *mut Object = msg_send![class!(VZVirtioBlockDeviceConfiguration), alloc];
         let config: *mut Object = msg_send![config, initWithAttachment: attachment];
         Ok(config)
     }
@@ -315,19 +335,21 @@ impl VirtualMachine {
         if !error.is_null() {
             let desc: *mut Object = msg_send![error, localizedDescription];
             let desc_str: *const i8 = msg_send![desc, UTF8String];
-            std::ffi::CStr::from_ptr(desc_str).to_string_lossy().to_string()
+            std::ffi::CStr::from_ptr(desc_str)
+                .to_string_lossy()
+                .to_string()
         } else {
             "erreur inconnue".to_string()
         }
     }
 
     unsafe fn start_vm(&self, vm: *mut Object) -> Result<()> {
-        println!("\n🚀 Démarrage de la VM...");
+        println!("\nDemarrage de la VM...");
         let block = ConcreteBlock::new(|error: *mut Object| {
             if !error.is_null() {
                 disable_raw_mode();
                 let msg = VirtualMachine::nsobj_error_string(error);
-                eprintln!("\nErreur au démarrage de la VM : {}", msg);
+                eprintln!("\nErreur au demarrage de la VM : {}", msg);
                 std::process::exit(1);
             }
         });
@@ -342,7 +364,7 @@ impl VirtualMachine {
         } else {
             std::env::current_dir()?.join(path)
         };
-        
+
         let s = NSString::from_str(abs_path.to_str().unwrap());
         Ok(msg_send![class!(NSURL), fileURLWithPath: &*s])
     }
@@ -361,39 +383,39 @@ fn main() -> Result<()> {
     }
 
     let config = VMConfig::load_or_default();
+    let disk_info = match &config.iso_path {
+        Some(iso) if std::path::Path::new(iso).exists() => "Mode: Installation depuis ISO",
+        _ => "Mode: Image cloud pre-installee",
+    };
     println!(
-        "VM: {} | CPU: {} | RAM: {} Go | Disque: {} Go",
-        config.name, config.cpu_count, config.memory_size_gb, config.disk_size_gb
+        "VM: {} | CPU: {} | RAM: {} Go | {}",
+        config.name, config.cpu_count, config.memory_size_gb, disk_info
     );
 
     let vm = VirtualMachine::new(config);
     vm.create_vm()?;
 
-    // Tous les messages AVANT le mode raw (sinon \n ne fait plus \r\n)
-    println!("\n╔══════════════════════════════════════════════════╗");
-    println!("║  Console série active — mode raw                  ║");
-    println!("║  Flèches / Tab / touches spéciales : OK           ║");
-    println!("║  Ctrl+C pour arrêter la VM.                       ║");
-    println!("║                                                    ║");
-    println!("║  Astuce GRUB : touche 'e' pour éditer, puis       ║");
-    println!("║  ajouter console=hvc0 à la ligne 'linux' si       ║");
-    println!("║  l'installeur ne s'affiche pas correctement.      ║");
-    println!("╚══════════════════════════════════════════════════╝");
+    println!("\n┌──────────────────────────────────────────────────┐");
+    println!("│  Console serie active - mode raw                  │");
+    println!("│  Fleches / Tab / touches speciales : OK           │");
+    println!("│  Ctrl+C pour arreter la VM.                       │");
+    println!("│                                                    │");
+    println!("│  Login: root    Password: root                    │");
+    println!("│  (defini via cloud-init seed)                     │");
+    println!("└──────────────────────────────────────────────────┘");
 
     use std::io::Write;
     std::io::stdout().flush()?;
 
-    // Activer le mode raw APRÈS tous les println!
     enable_raw_mode();
 
-    // Enregistrer les handlers de nettoyage du terminal
     unsafe {
         libc::atexit(on_exit_cleanup);
         libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
         libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
     }
 
-    // Boucle principale (bloque ici indéfiniment)
+    // Boucle principale (bloque ici indefiniment)
     unsafe {
         let run_loop: *mut Object = msg_send![class!(NSRunLoop), mainRunLoop];
         let _: () = msg_send![run_loop, run];

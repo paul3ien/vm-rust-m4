@@ -1,4 +1,8 @@
-rm -f data/disk.img nvram.dat
+# Preparation (une seule fois)
+bash prepare_cloud_image.sh
+
+# Lancement
+rm -f nvram.dat
 cargo build
 codesign --entitlements entitlements.plist --force -s - target/debug/vm-rust-m4
 ./target/debug/vm-rust-m4
